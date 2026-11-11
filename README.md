@@ -25,4 +25,25 @@ A config file names a taskset, a harness label, and a slot count. `cybergym-eval
 
 One sharp edge worth knowing up front: `run` never re-touches a task that already has a database row, in any status. If you stop a run partway through, resuming it means resetting the stopped rows back to `pending` yourself before relaunching — `recover` only handles rows stuck in `running` from a crash, not ones you deliberately interrupted.
 
+## Or drive it from Python: the Gym
+
+The CLI drives a `harnesses/` directory of Docker images through JSON configs. `cybergym_eval.gym.Gym` is the same machinery as a library, for when you want to try an agent interactively instead of writing a config file:
+
+```python
+from cybergym_eval.gym import Gym
+
+gym = Gym(work_root="~/cybergym-gym", benchmark_slots=4)
+tasks = gym.taskset("smoke", sample=5, seed=0)   # seeded draw from the real CyberGym pool
+
+class MyAgent:
+    def solve(self, task, box, lm):
+        ...  # box is the sandbox, lm is the metered model client
+
+agent = gym.agent(MyAgent, temperature=0.2)
+for r in agent.rollouts(tasks):
+    print(r.task, r.passed, r.feedback)
+```
+
+`gym.agent()` also takes a prebuilt Docker harness straight from `cybergym-harnesses` in place of a Python class — same `Rollout` objects either way, so a container-based harness and a one-off Python agent are interchangeable from the caller's side.
+
 Needs Docker and AWS Bedrock credentials (`~/.secrets/bedrock.env`, `KEY=VALUE` lines) on the host.
