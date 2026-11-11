@@ -1,0 +1,23 @@
+{
+  "benchmark_root": "~/cybergym",
+  "work_root": "~/cybergym-work",
+  "data_dir": "~/cybergym_data",
+  "env_file": "~/.secrets/bedrock.env",
+  "taskset": "pilot",
+  "split": "all",
+  "tasks": [
+    "arvo:1065"
+  ],
+  "difficulty": "level1",
+  "harness_repo": "~/cybergym-harnesses",
+  "harnesses": [
+    "null"
+  ],
+  "benchmark_slots": 1,
+  "task_cpus": 2,
+  "task_memory_gb": 6,
+  "use_firewall": true,
+  "model_provider": "openai-compatible",
+  "model": "deepseek.v3.2",
+  "aws_region": "us-east-1"
+}

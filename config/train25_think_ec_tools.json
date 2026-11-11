@@ -1,0 +1,62 @@
+{
+  "benchmark_root": "~/cybergym",
+  "work_root": "~/cybergym-work",
+  "data_dir": "~/cybergym_data",
+  "env_file": "~/.secrets/bedrock.env",
+  "taskset": "train25",
+  "tasks": [
+    "arvo:46543",
+    "arvo:50326",
+    "arvo:14245",
+    "arvo:33844",
+    "arvo:57788",
+    "arvo:56272",
+    "arvo:48863",
+    "arvo:38393",
+    "arvo:55556",
+    "arvo:44199",
+    "arvo:63163",
+    "arvo:29633",
+    "arvo:57410",
+    "arvo:23296",
+    "arvo:35876",
+    "arvo:23350",
+    "arvo:19702",
+    "arvo:6581",
+    "arvo:32785",
+    "arvo:59390",
+    "oss-fuzz:42537169",
+    "arvo:64574",
+    "arvo:23787",
+    "arvo:38952",
+    "arvo:19999"
+  ],
+  "difficulty": "level2",
+  "dataset_revision": "bde190ded494e52bc684b66073b436c9d992c7c6",
+  "drawn_from": {
+    "sample": 50,
+    "seed": 0,
+    "pool": 1507,
+    "part": "first 25"
+  },
+  "harness_repo": "~/cybergym-harnesses",
+  "harnesses": [
+    {
+      "name": "codex_think_ec_tools",
+      "label": "codex_think_ec_tools"
+    }
+  ],
+  "benchmark_slots": 10,
+  "task_cpus": 1,
+  "task_memory_gb": 2,
+  "use_firewall": true,
+  "model_provider": "openai-compatible",
+  "model": "deepseek.v3.2",
+  "aws_region": "us-east-1",
+  "price_in_per_m": 0.62,
+  "price_out_per_m": 1.85,
+  "agent_timeout_seconds": 7200,
+  "task_deadline_seconds": 8100,
+  "spend_cap_usd": null,
+  "experiment_note": "Run 3 of codex_think_ec: same as the v5 label (thinking, end condition, 500-iteration cap, context summarization with a fit guarantee, kernel-enforced write gate, evaluator-side final submission, 7200 s agent budget, no spend cap, retrying shim), plus: every tool call runs under a supervisor with a wall-clock deadline that kills the whole process tree including background/detached children (60 s default, 300 s max, an invalid timeout is rejected outright, not silently defaulted); a run where cleanup cannot be confirmed is an infrastructure error, not graded; DeepSeek's native tool-call syntax (DSML) is recovered into a real tool call instead of being discarded when it leaks as plain text; the submission client has its own bounded budget (200 s) nested inside a 240 s tool deadline and classifies a rate-limited (HTTP 429) reply distinctly from 'no result'. Earlier runs of this experiment: codex_think_ec (v4, stopped, kept as evidence) and codex_think_ec_v5 (stopped: tool-call leak losing rounds + unbounded background loops hammering the submission server; 5 passed, 1 failed, 19 operator-stopped; see D39)."
+}

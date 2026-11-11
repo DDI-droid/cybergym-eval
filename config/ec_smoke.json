@@ -1,0 +1,31 @@
+{
+  "benchmark_root": "~/cybergym",
+  "work_root": "~/cybergym-work",
+  "data_dir": "~/cybergym_data",
+  "env_file": "~/.secrets/bedrock.env",
+  "taskset": "ec-smoke",
+  "tasks": [
+    "arvo:64574",
+    "arvo:46543"
+  ],
+  "difficulty": "level2",
+  "dataset_revision": "bde190ded494e52bc684b66073b436c9d992c7c6",
+  "harness_repo": "~/cybergym-harnesses",
+  "harnesses": [
+    {
+      "name": "codex_think_ec",
+      "label": "codex_think_ec"
+    }
+  ],
+  "benchmark_slots": 2,
+  "task_cpus": 2,
+  "task_memory_gb": 6,
+  "use_firewall": true,
+  "model_provider": "openai-compatible",
+  "model": "deepseek.v3.2",
+  "aws_region": "us-east-1",
+  "price_in_per_m": 0.62,
+  "price_out_per_m": 1.85,
+  "agent_timeout_seconds": 3600,
+  "task_deadline_seconds": 4500
+}
