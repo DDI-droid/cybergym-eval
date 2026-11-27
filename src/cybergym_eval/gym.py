@@ -37,6 +37,15 @@ class TaskSet:
     def __len__(self) -> int:
         return len(self.tasks)
 
+    def sample(self, n: int, seed: int = 0) -> TaskSet:
+        """n tasks of this set, drawn with seed. It is the same task set with fewer tasks: rollouts land in the
+        same folder and database, and nothing is saved, because the same n and seed always give the same tasks."""
+        if type(n) is not int or not 1 <= n <= len(self.tasks):
+            raise ValueError(f"sample must be a whole number from 1 to {len(self.tasks)}")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        return TaskSet(self.name, tuple(random.Random(seed).sample(sorted(self.tasks), n)), self.config)
+
 
 @dataclass(frozen=True)
 class Rollout:
@@ -143,11 +152,13 @@ class Agent:
         with work_lock(config):
             clean_leftovers(config, docker.from_env())
             con = db.connect(db_path(config))
+            # A task set made by a CLI config can give single tasks their own level.
+            difficulty = {entry["task"]: entry["difficulty"] for entry in config["tasks"]}
             for task in chosen:
                 execution_id = uuid.uuid4().hex[:20]
                 folder = base / task_folder_name(task) / execution_id
-                specs.append(RunSpec(task, config["difficulty"], self.name, execution_id, str(folder)))
-                db.register(con, execution_id, self.fingerprint, self.name, config["split"], task, config["difficulty"])
+                specs.append(RunSpec(task, difficulty[task], self.name, execution_id, str(folder)))
+                db.register(con, execution_id, self.fingerprint, self.name, config["split"], task, difficulty[task])
             con.close()
             function = execute_wrapped if self.container_harness else execute_python
             results = run_specs(config, specs, function, args=(self.agent_class, self.settings, self.fingerprint))
@@ -226,54 +237,64 @@ class Gym:
             self._base["task_deadline_seconds"] = task_deadline_seconds
         self.work_root = Path(work_root).expanduser().resolve()
 
-    def _config(self, name: str, tasks: list[str]) -> dict[str, Any]:
-        return finish_config({**self._base, "taskset": name, "tasks": list(tasks)}, Path.home())
+    def _config(self, name: str, tasks: list[Any] | dict[str, Any]) -> dict[str, Any]:
+        return finish_config({**self._base, "taskset": name, "tasks": tasks}, Path.home())
+
+    def _check_tasks(self, name: str, tasks: list[str], pool: dict[str, dict[str, Any]]) -> None:
+        missing = [task for task in tasks if task not in pool]
+        if missing:
+            raise ValueError(f"Not in the CyberGym task list: {missing}")
+        leaked = sorted(set(tasks) & self.held_out)
+        if leaked:
+            raise ValueError(f"Task set {name!r} contains held-out tasks: {leaked}")
 
     def taskset(
-        self, name: str, tasks: Iterable[str] | None = None, *, sample: int | None = None, seed: int = 0,
-        exclude: TaskSet | Iterable[str | TaskSet] = (),
+        self, name: str, tasks: Iterable[str] | None = None, *, sample: int | None = None, seed: int | None = None,
     ) -> TaskSet:
+        """Open or create a named task set, the way a config's "tasks" does:
+
+            taskset(name)                      opens the saved set
+            taskset(name, tasks=[ids])         a set of the tasks you list
+            taskset(name, sample=n, seed=s)    n tasks drawn from CyberGym's task list, held-out tasks left out
+
+        A name stands for one fixed set: asking for other tasks under it is refused. To run a few tasks of a
+        set, use its .sample(n, seed=...)."""
         _check_name("task set name", name)
+        if tasks is not None and sample is not None:
+            raise ValueError("pass tasks= (your list) or sample= (a draw from CyberGym's task list), not both; "
+                             "to draw a few tasks from a task set, use taskset.sample(n, seed=...)")
+        if seed is not None and sample is None:
+            raise ValueError("seed= goes with sample=")
         revision = self._base["dataset_revision"]
         data_dir = Path(self._base["data_dir"]).expanduser()
         data_dir.mkdir(parents=True, exist_ok=True)
         pool = load_pool(data_dir, revision)
-        drawn_from = None
-        if tasks is None and sample is None:
+        if tasks is not None:
+            if isinstance(tasks, str):
+                raise ValueError("tasks= takes a list of task IDs, not one string")
+            spec: list[Any] | dict[str, Any] = list(tasks)
+        elif sample is not None:
+            spec = {"sample": sample, "seed": 0 if seed is None else seed}
+        else:
             saved_path = self.work_root / name / "taskset.json"
             if not saved_path.exists():
                 raise ValueError(f"There is no task set {name!r} in {self.work_root}; create it with tasks=[...] or sample=n")
             saved = json.loads(saved_path.read_text(encoding="utf-8"))
-            if saved.get("kind") != "list":
-                raise ValueError(f"Task set {name!r} was drawn by a sample config; use it through the CLI")
-            chosen = list(saved["tasks"])
-        else:
-            if tasks is None:
-                raise ValueError("sample= draws from tasks=: pass the task IDs to draw from (your training IDs), never the whole pool")
-            excluded = set(_task_ids(exclude))
-            candidates = [task for task in tasks if task not in excluded]
-            missing = [task for task in candidates if task not in pool]
-            if missing:
-                raise ValueError(f"Not in the CyberGym task list: {missing}")
-            if sample is None:
-                chosen = candidates
-                drawn_from = {"excluded": len(excluded)} if excluded else None
-            else:
-                if type(sample) is not int or not 1 <= sample <= len(candidates):
-                    raise ValueError(f"sample must be a whole number from 1 to {len(candidates)}")
-                chosen = random.Random(seed).sample(sorted(candidates), sample)
-                drawn_from = {
-                    "sample": sample, "seed": seed, "candidates": len(candidates),
-                    "excluded": len(excluded), "dataset_revision": revision,
-                }
-        leaked = sorted(set(chosen) & self.held_out)
-        if leaked:
-            raise ValueError(f"Task set {name!r} contains held-out tasks: {leaked}")
-        config = self._config(name, chosen)
-        if ensure_taskset(config, pool, revision, raw_tasks=chosen, drawn_from=drawn_from):
-            config = self._config(name, chosen)
+            spec = saved["sampled_from"] if saved["kind"] == "sample" else saved["tasks"]
+        # Refuses here if the name already holds other tasks, a different draw, or another dataset revision.
+        config = self._config(name, spec)
+        if isinstance(config["tasks"], list):  # a listed set, or one already saved: check before anything is written
+            self._check_tasks(name, [entry["task"] for entry in config["tasks"]], pool)
+            draw_pool, note = pool, None
+        else:  # a new sample: draw it the way a config does, from the task list without the held-out tasks
+            left_out = sorted(self.held_out & pool.keys())
+            draw_pool = {task: entry for task, entry in pool.items() if task not in self.held_out}
+            note = {"held_out_left_out": left_out} if left_out else None
+        if ensure_taskset(config, draw_pool, revision, raw_tasks=spec, drawn_from=note):
+            config = self._config(name, spec)
+            self._check_tasks(name, [entry["task"] for entry in config["tasks"]], pool)
         stage_tasks(config, docker.from_env(), pool, revision)
-        return TaskSet(name, tuple(chosen), config)
+        return TaskSet(name, tuple(entry["task"] for entry in config["tasks"]), config)
 
     def agent(self, agent_class: type, name: str | None = None, **settings: Any) -> Agent:
         return Agent(agent_class, name, settings)
