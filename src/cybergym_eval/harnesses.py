@@ -20,9 +20,22 @@ def read_manifest(directory: Path) -> dict[str, Any]:
         raise ValueError(f"{path} must set entry, e.g. entry = [\"python3\", \"/harness/main.py\"]")
     if "agent_timeout_seconds" in manifest:
         raise ValueError(f"{path}: time limits belong in the eval config (agent_timeout_seconds), not in a harness")
+    models = manifest.get("models")
+    if models is not None and (
+        not isinstance(models, list) or not models or not all(isinstance(m, str) and m for m in models) or len(set(models)) != len(models)
+    ):
+        raise ValueError(f'{path}: models must be a list of model names, e.g. models = ["deepseek.v3.2"]')
     manifest.setdefault("image", BASE_IMAGE)
     manifest.setdefault("settings", {})
     return manifest
+
+
+def harness_models(config: dict[str, Any], harness: dict[str, Any]) -> list[str]:
+    """The models a harness says it uses, from its live harness.toml; prepare requires them in the models table."""
+    models = read_manifest(harness_definition_dir(config, harness)).get("models")
+    if not models:
+        raise ValueError(f'Harness {harness["name"]!r} lists no models; add e.g. models = ["deepseek.v3.2"] to its harness.toml')
+    return models
 
 
 def _tree_hash(roots: list[Path]) -> str:
@@ -38,6 +51,12 @@ def _tree_hash(roots: list[Path]) -> str:
 
 def _code_dir(config: dict[str, Any], harness: dict[str, Any]) -> Path:
     return harness_dir(config, harness) / "code"
+
+
+def _frozen_manifest(target: Path) -> dict[str, Any]:
+    """The manifest is kept beside the mounted folder (code/harness.toml), so the agent never sees it. Labels frozen
+    by the older code kept it inside code/harness/."""
+    return read_manifest(target if (target / "harness.toml").is_file() else target / "harness")
 
 
 def _current_image_id(manifest: dict[str, Any]) -> str:
@@ -77,7 +96,7 @@ def check_code(config: dict[str, Any], harness: dict[str, Any]) -> None:
             f"The code of harness {harness['name']!r} changed since label {harness['label']!r} was frozen. "
             "Use a new label for the new code."
         )
-    manifest = read_manifest(target / "harness")
+    manifest = _frozen_manifest(target)
     recorded = target / "image.id"
     now = _current_image_id(manifest)
     if recorded.exists() and recorded.read_text(encoding="utf-8").strip() != now:
@@ -104,7 +123,10 @@ def snapshot_code(config: dict[str, Any], harness: dict[str, Any]) -> str:
         _record_image(manifest, target)
         return current
     shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(source, target / "harness", ignore=shutil.ignore_patterns("__pycache__"))
+    # The folder that gets mounted at /harness holds the harness's files but not its manifest: the runner reads
+    # harness.toml on the host, and the agent has no use for it. The hash above still covers it.
+    shutil.copytree(source, target / "harness", ignore=shutil.ignore_patterns("__pycache__", "harness.toml"))
+    shutil.copy2(source / "harness.toml", target / "harness.toml")
     if common.exists():
         shutil.copytree(common, target / "common", ignore=shutil.ignore_patterns("__pycache__"))
     else:
@@ -119,7 +141,7 @@ def frozen_code(config: dict[str, Any], harness: dict[str, Any]) -> dict[str, An
     stamp = target / "code.sha256"
     if not stamp.exists():
         raise ValueError(f"Harness {harness['label']!r} has no frozen code; run prepare first")
-    manifest = read_manifest(target / "harness")
+    manifest = _frozen_manifest(target)
     image_file = target / "image.id"
     return {
         "image_id": image_file.read_text(encoding="utf-8").strip() if image_file.exists() else None,

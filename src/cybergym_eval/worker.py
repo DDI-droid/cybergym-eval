@@ -75,6 +75,12 @@ def _generate_task(config: dict[str, Any], spec: RunSpec, workspace: Path, agent
     )
 
 
+def code_models(config: dict[str, Any], code: dict[str, Any]) -> list[str]:
+    """The models a container harness may use: the list in its harness.toml. A Gym-wrapped Python agent has no
+    such list and uses the Gym's one model."""
+    return list(code["manifest"].get("models") or ([config["model"]] if config.get("model") else []))
+
+
 def _run_harness(
     config: dict[str, Any], spec: RunSpec, code: dict[str, Any], key: str, workspace: Path, output: Path, timeout: int,
     agent_id: str | None = None,
@@ -94,7 +100,7 @@ def _run_harness(
     environment = {
         "OPENAI_BASE_URL": shim_url(config),
         "OPENAI_API_KEY": key,
-        "CYBERGYM_MODEL": config["model"],
+        "CYBERGYM_MODELS": json.dumps(code_models(config, code)),  # names only; the shim holds URLs and keys
         "CYBERGYM_TIME_LIMIT_S": str(timeout),
         "CYBERGYM_HARNESS_SETTINGS": json.dumps(code["settings"]),
         "NO_PROXY": gateway,
@@ -375,6 +381,9 @@ class _ContainerAgent:
         self.code = frozen_code(self.config, self.harness)
         result["code_sha256"] = self.code["code_sha256"]
 
+    def models(self) -> list[str]:
+        return code_models(self.config, self.code)
+
     def act(self, workspace: Path, output: Path, key: str, timeout: int, agent_id: str | None = None) -> dict[str, Any]:
         return _run_harness(self.config, self.spec, self.code, key, workspace, output, timeout, agent_id)
 
@@ -392,6 +401,9 @@ class _PythonAgent:
 
     def check(self, result: dict[str, Any]) -> None:
         return None
+
+    def models(self) -> list[str]:
+        return [self.config["model"]]  # a Gym Python agent uses the Gym's model
 
     def act(self, workspace: Path, output: Path, key: str, timeout: int, agent_id: str | None = None) -> dict[str, Any]:
         return run_python_agent(self.config, self.spec, self.agent_class, self.settings, key, workspace, output, timeout)
@@ -418,6 +430,9 @@ class _WrappedContainerAgent:
     def check(self, result):
         self.code = self.harness.container_code(self.settings)
         result["code_sha256"] = self.code["code_sha256"]
+
+    def models(self):
+        return code_models(self.config, self.code)
 
     def act(self, workspace, output, key, timeout, agent_id=None):
         return _run_harness(self.config, self.spec, self.code, key, workspace, output, timeout, agent_id)
@@ -462,7 +477,9 @@ def _execute(config: dict[str, Any], spec: RunSpec, agent: _ContainerAgent | _Py
         result["agent_id"] = agent_id
         _generate_task(config, spec, workspace, agent_id)
         metadata = _capture_submission(workspace, agent_id, folder)
-        key = issue_key(config, spec.execution_id)
+        result["models"] = agent.models()
+        result["benchmark_slots"] = config["benchmark_slots"]  # changeable between runs, so recorded per execution
+        key = issue_key(config, spec.execution_id, result["models"])
         remaining = deadline - (time.monotonic() - started)
         if remaining < 120:
             raise DeadlineExceeded("deadline reached before the agent started")

@@ -175,7 +175,7 @@ def build_views(config: dict[str, Any], rows: list[dict[str, Any]], summary: dic
             trajectory_page(folder, row)
     header = (
         f"<h1>{_esc(config['taskset'])} &middot; {_esc(config['split'])}</h1>"
-        f"<p class=\"muted\">model {_esc(config['model'])} &middot; {_esc(summary['executions'])} executions &middot; "
+        f"<p class=\"muted\">models {_esc(', '.join(summary.get('models') or []))} &middot; {_esc(summary['executions'])} executions &middot; "
         f"{_esc(config['benchmark_slots'])} at a time &middot; generated "
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>"
     )

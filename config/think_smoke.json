@@ -20,11 +20,17 @@
   "task_cpus": 2,
   "task_memory_gb": 6,
   "use_firewall": true,
-  "model_provider": "openai-compatible",
-  "model": "deepseek.v3.2",
-  "aws_region": "us-east-1",
-  "price_in_per_m": 0.62,
-  "price_out_per_m": 1.85,
+  "models": {
+    "deepseek.v3.2": {
+      "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+      "api_key_env": [
+        "OPENAI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK"
+      ],
+      "price_in_per_m": 0.62,
+      "price_out_per_m": 1.85
+    }
+  },
   "agent_timeout_seconds": 3600,
   "task_deadline_seconds": 4500
 }

@@ -50,11 +50,17 @@
   "task_cpus": 1,
   "task_memory_gb": 2,
   "use_firewall": true,
-  "model_provider": "openai-compatible",
-  "model": "deepseek.v3.2",
-  "aws_region": "us-east-1",
-  "price_in_per_m": 0.62,
-  "price_out_per_m": 1.85,
+  "models": {
+    "deepseek.v3.2": {
+      "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+      "api_key_env": [
+        "OPENAI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK"
+      ],
+      "price_in_per_m": 0.62,
+      "price_out_per_m": 1.85
+    }
+  },
   "agent_timeout_seconds": 7200,
   "task_deadline_seconds": 8100,
   "experiment_note": "Same harness as codex_think_ec_tools2 (string shell/write_file contract, submission gate, corrected context-fit) with reasoning_effort set to 'none' -- a real off-switch on this deployment (confirmed valid values: none/low/medium/high), not just the lowest reasoning level. codex_think_ec_tools2 (high) was stopped at 7 passed / 3 benchmark_failed / 15 interrupted (kept as real evidence, see archive train25-codex_think_ec_tools2-stopped-*). codex_think_ec_tools2_low (low) was stopped within about a minute of launch, before any real task progress, to go straight to 'none' instead."

@@ -21,6 +21,7 @@ from .shim import start_shim
 from .worker import execute_python, execute_wrapped
 
 DEFAULT_REVISION = "bde190ded494e52bc684b66073b436c9d992c7c6"
+BEDROCK_OPENAI_URL = "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
 PATH_KEYS = ("benchmark_root", "data_dir", "harness_repo", "binary_dir")
 
 
@@ -177,6 +178,8 @@ class Gym:
         *,
         difficulty: str = "level2",
         model: str = "deepseek.v3.2",
+        base_url: str = BEDROCK_OPENAI_URL,
+        api_key_env: str | list[str] = ("OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"),
         env_file: str = "~/.secrets/bedrock.env",
         benchmark_slots: int = 4,
         task_cpus: float = 2,
@@ -205,15 +208,14 @@ class Gym:
             "env_file": env_file,
             "difficulty": difficulty,
             "dataset_revision": dataset_revision,
-            "model_provider": "openai-compatible",
+            # One model for everything this Gym runs: its Python agents, and container harnesses wrapped from them.
             "model": model,
-            "aws_region": "us-east-1",
+            "models": {model: {"base_url": base_url, "api_key_env": list([api_key_env] if isinstance(api_key_env, str) else api_key_env),
+                               "price_in_per_m": price_in_per_m, "price_out_per_m": price_out_per_m}},
             "benchmark_slots": benchmark_slots,
             "task_cpus": task_cpus,
             "task_memory_gb": task_memory_gb,
             "agent_timeout_seconds": agent_timeout_seconds,
-            "price_in_per_m": price_in_per_m,
-            "price_out_per_m": price_out_per_m,
             "server_port": server_port,
             "shim_port": shim_port,
             "use_firewall": True,
