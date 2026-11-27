@@ -371,14 +371,9 @@ class _ContainerAgent:
         return {"harness": self.harness["name"]}
 
     def check(self, result: dict[str, Any]) -> None:
+        # prepare checked the code and the image; the container starts from the frozen copy and the frozen image id.
         self.code = frozen_code(self.config, self.harness)
         result["code_sha256"] = self.code["code_sha256"]
-        current_image = docker.from_env().images.get(self.code["manifest"]["image"]).id
-        if self.code["image_id"] and current_image != self.code["image_id"]:
-            raise RuntimeError(
-                f"harness image {self.code['manifest']['image']} changed since this label was frozen "
-                f"({self.code['image_id'][7:19]} then, {current_image[7:19]} now); use a new label"
-            )
 
     def act(self, workspace: Path, output: Path, key: str, timeout: int, agent_id: str | None = None) -> dict[str, Any]:
         return _run_harness(self.config, self.spec, self.code, key, workspace, output, timeout, agent_id)

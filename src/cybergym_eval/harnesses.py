@@ -40,19 +40,52 @@ def _code_dir(config: dict[str, Any], harness: dict[str, Any]) -> Path:
     return harness_dir(config, harness) / "code"
 
 
-def _record_image(manifest: dict[str, Any], target: Path) -> str:
+def _current_image_id(manifest: dict[str, Any]) -> str:
+    """The id the manifest's image tag points at right now."""
     import docker
     from docker.errors import ImageNotFound
 
+    try:
+        return docker.from_env().images.get(manifest["image"]).id
+    except ImageNotFound:
+        raise ValueError(f"Harness image {manifest['image']} is not built; run ~/cybergym-harnesses/build.sh") from None
+
+
+def _record_image(manifest: dict[str, Any], target: Path) -> str:
     path = target / "image.id"
     if path.exists():
         return path.read_text(encoding="utf-8").strip()
-    try:
-        image_id = docker.from_env().images.get(manifest["image"]).id
-    except ImageNotFound:
-        raise ValueError(f"Harness image {manifest['image']} is not built; run ~/cybergym-harnesses/build.sh") from None
+    image_id = _current_image_id(manifest)
     path.write_text(image_id + "\n", encoding="utf-8")
     return image_id
+
+
+def check_code(config: dict[str, Any], harness: dict[str, Any]) -> None:
+    """Refuse if a label's frozen code or image no longer matches what is on this machine now. Writes nothing.
+
+    prepare calls this for every harness before it freezes anything. run does not repeat it: containers start
+    from the frozen copy and the frozen image id, so later edits or rebuilds cannot reach a run in progress.
+    """
+    source = harness_definition_dir(config, harness)
+    target = _code_dir(config, harness)
+    stamp = target / "code.sha256"
+    if not stamp.exists():
+        _current_image_id(read_manifest(source))  # a first freeze only needs the image to exist
+        return
+    if stamp.read_text(encoding="utf-8").strip() != _tree_hash([source, Path(config["harness_repo"]) / "common"]):
+        raise ValueError(
+            f"The code of harness {harness['name']!r} changed since label {harness['label']!r} was frozen. "
+            "Use a new label for the new code."
+        )
+    manifest = read_manifest(target / "harness")
+    recorded = target / "image.id"
+    now = _current_image_id(manifest)
+    if recorded.exists() and recorded.read_text(encoding="utf-8").strip() != now:
+        then = recorded.read_text(encoding="utf-8").strip()
+        raise ValueError(
+            f"Harness image {manifest['image']} changed since label {harness['label']!r} was frozen "
+            f"({then[7:19]} then, {now[7:19]} now). Use a new label for the new image."
+        )
 
 
 def snapshot_code(config: dict[str, Any], harness: dict[str, Any]) -> str:

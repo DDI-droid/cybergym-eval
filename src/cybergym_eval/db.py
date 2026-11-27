@@ -102,6 +102,11 @@ def mark_lost(con: sqlite3.Connection, execution_id: str, error: str, status: st
     return cursor.rowcount > 0
 
 
+def config_hashes(con: sqlite3.Connection, label: str, split: str) -> set[str]:
+    query = "SELECT DISTINCT config_hash FROM executions WHERE label=? AND split=?"
+    return {row[0] for row in con.execute(query, (label, split))}
+
+
 def rows(con: sqlite3.Connection, label: str | None = None, split: str | None = None) -> list[sqlite3.Row]:
     if label is None:
         return list(con.execute("SELECT * FROM executions ORDER BY label, split, task"))
