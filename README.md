@@ -61,16 +61,24 @@ The CLI drives a `harnesses/` directory of Docker images through JSON configs. `
 from cybergym_eval.gym import Gym
 
 gym = Gym(work_root="~/cybergym-gym", benchmark_slots=4)
-tasks = gym.taskset("smoke", tasks=TRAIN_IDS, sample=5, seed=0)   # seeded draw from ids you pass, never the whole pool
+train = gym.taskset("train25", tasks=TRAIN_IDS)   # TRAIN_IDS: a list of task ids you write
+smoke = train.sample(5, seed=0)                    # 5 of those tasks: the same task set, fewer tasks
 
 class MyAgent:
     def solve(self, task, box, lm):
         ...  # box is the sandbox, lm is the metered model client
 
 agent = gym.agent(MyAgent, temperature=0.2)
-for r in agent.rollouts(tasks):
+for r in agent.rollouts(smoke):
     print(r.task, r.passed, r.feedback)
 ```
+
+A task set works as it does in a config: a name stands for one fixed set of tasks, saved in `<work_root>/<name>/taskset.json`.
+
+- `gym.taskset("train25", tasks=[...])` creates a set of the tasks you list.
+- `gym.taskset("pool50", sample=50, seed=0)` creates a set drawn from CyberGym's task list, the same draw a config with `"tasks": {"sample": 50, "seed": 0}` makes, except that the Gym's `held_out` tasks are left out first (the file records which).
+- `gym.taskset("train25")` opens a saved set by name, including one a CLI config made. Asking for other tasks under a saved name is refused; use a new name.
+- `train.sample(5, seed=0)` picks 5 tasks of a set. It is not saved, because the same number and seed always give the same tasks; rollouts of it go to the set's own folder.
 
 `gym.agent()` also takes a prebuilt Docker harness straight from `cybergym-harnesses` in place of a Python class — same `Rollout` objects either way, so a container-based harness and a one-off Python agent are interchangeable from the caller's side.
 
