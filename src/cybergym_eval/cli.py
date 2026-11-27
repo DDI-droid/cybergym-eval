@@ -23,12 +23,12 @@ from .config import (
     config_hash,
     db_path,
     harness_by_label,
-    harness_definition_dir,
     harness_dir,
     load_config,
+    prepared_stamp,
 )
 from .failures import upstream_failure
-from .harnesses import read_manifest
+from .harnesses import frozen_code
 from .prepare import MIN_FREE_GB, PROXY_CONTAINER, free_disk_gb, prepare, runner_images, task_has_binaries
 from .scheduler import WorkFolderBusy, clean_leftovers, run_specs, work_lock
 from .scheduler import parse_time as _parse_time
@@ -88,19 +88,20 @@ def _task_checks(config: dict[str, Any], client: docker.DockerClient) -> list[Ch
 
 
 def _harness_checks(config: dict[str, Any], client: docker.DockerClient | None) -> list[Check]:
+    """What run will use is the frozen copy and the frozen image id, so those are what must be on this machine."""
     checks = []
     for harness in config["harnesses"]:
-        definition = harness_definition_dir(config, harness)
         try:
-            manifest = read_manifest(definition)
+            code = frozen_code(config, harness)
         except ValueError as error:
             checks.append((f"harness {harness['label']}", False, str(error)))
             continue
-        checks.append((f"harness {harness['label']} definition", True, str(definition / "harness.toml")))
+        checks.append((f"harness {harness['label']} frozen code", True, code["code_sha256"][:12]))
         if client:
-            present = _has_image(client, manifest["image"])
-            detail = manifest["image"] if present else f"{manifest['image']} missing; run ~/cybergym-harnesses/build.sh"
-            checks.append((f"harness {harness['label']} image", present, detail))
+            image = code["image_id"] or code["manifest"]["image"]
+            present = _has_image(client, image)
+            detail = image[:19] if present else f"{image[:19]} is no longer on this machine (removed since prepare?)"
+            checks.append((f"harness {harness['label']} frozen image", present, detail))
     return checks
 
 
@@ -453,9 +454,32 @@ def run(config: dict[str, Any]) -> int:
         return 1
 
 
+def check_prepared(config: dict[str, Any]) -> None:
+    """run trusts prepare's checks and verifies one thing: that this exact config is the one prepare finished.
+
+    The stamp holds the hash of the resolved config (the file plus env_file values and environment variables
+    such as OPENAI_BASE_URL), so an edit made after prepare, or a prepare that never finished, stops the run here.
+    """
+    for harness in config["harnesses"]:
+        stamp = prepared_stamp(config, harness)
+        if not stamp.exists():
+            raise ValueError(f"Label {harness['label']!r} has not been prepared for split {config['split']!r}; run prepare first.")
+        if json.loads(stamp.read_text(encoding="utf-8"))["config_hash"] != config_hash(config, harness):
+            raise ValueError(
+                f"This config is not the one label {harness['label']!r} was prepared with (the config file, a value from "
+                "env_file or an environment variable such as OPENAI_BASE_URL changed). Run prepare: it checks the change "
+                "and says whether it needs a new label."
+            )
+
+
 def _run_locked(config: dict[str, Any]) -> int:
     from .worker import execute
 
+    try:
+        check_prepared(config)
+    except ValueError as error:
+        print(f"Refusing to run: {error}", file=sys.stderr)
+        return 1
     if preflight(config):
         print("Refusing to run until preflight passes.", file=sys.stderr)
         return 1

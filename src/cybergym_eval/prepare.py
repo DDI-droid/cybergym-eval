@@ -12,9 +12,20 @@ import docker
 from docker.errors import ImageNotFound, NotFound
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
+from . import db
 from .changes import record_change
-from .config import freeze_config, load_config, taskset_file
-from .harnesses import snapshot_code
+from .config import (
+    check_receipts,
+    config_hash,
+    db_path,
+    freeze_config,
+    load_config,
+    prepared_stamp,
+    sample_parts,
+    split_counts,
+    taskset_file,
+)
+from .harnesses import check_code, frozen_code, snapshot_code
 
 DATASET = "sunblaze-ucb/cybergym"
 BINARY_DATASET = "sunblaze-ucb/cybergym-server-binary"
@@ -55,9 +66,14 @@ def ensure_taskset(
         if sample["sample"] > len(pool):
             raise ValueError(f"Cannot sample {sample['sample']} tasks from {len(pool)}")
         chosen = random.Random(sample["seed"]).sample(sorted(pool), sample["sample"])
-        half = len(chosen) // 2
-        saved.update(kind="sample", sampled_from=sample, tasks=chosen, train=chosen[:half], test=chosen[half:])
-        summary = f"drew {len(chosen)} of {len(pool)} tasks with seed {sample['seed']} ({half} train, {len(chosen) - half} test)"
+        parts, start = {}, 0
+        for name, count in split_counts(len(chosen), sample_parts(sample)).items():
+            parts[name] = chosen[start:start + count]
+            start += count
+        saved.update(kind="sample", sampled_from=sample, tasks=chosen, parts=parts)
+        summary = f"drew {len(chosen)} of {len(pool)} tasks with seed {sample['seed']}"
+        if parts:
+            summary += " (" + ", ".join(f"{len(ids)} {name}" for name, ids in parts.items()) + ")"
     else:
         saved.update(kind="list", tasks=raw_tasks)
         summary = f"listed {len(config['tasks'])} task(s)"
@@ -251,6 +267,50 @@ def stage_tasks(
     pull_images(client, runner_images(Path(config["binary_dir"]), tasks))
 
 
+def _recorded_hashes(config: dict[str, Any]) -> dict[str, set[str]]:
+    path = db_path(config)
+    if not path.exists():
+        return {}
+    con = db.connect(path)
+    try:
+        return {harness["label"]: db.config_hashes(con, harness["label"], config["split"]) for harness in config["harnesses"]}
+    finally:
+        con.close()
+
+
+def check_frozen(config: dict[str, Any]) -> None:
+    """Every freeze check, before anything is written, so a refusal leaves nothing half frozen.
+
+    The config file as written (receipt), the resolved settings (stamp and earlier rows), the harness code (hash)
+    and the harness image (id). run trusts these and only checks that its config is the one prepared.
+    """
+    check_receipts(config)
+    recorded = _recorded_hashes(config)
+    for harness in config["harnesses"]:
+        check_code(config, harness)
+        current = config_hash(config, harness)
+        stamp = prepared_stamp(config, harness)
+        before = {json.loads(stamp.read_text(encoding="utf-8"))["config_hash"]} if stamp.exists() else set()
+        if (before | recorded.get(harness["label"], set())) - {current}:
+            raise ValueError(
+                f"Label {harness['label']!r} was prepared or run with different settings for split {config['split']!r}: "
+                "the config file, a value from env_file or an environment variable such as OPENAI_BASE_URL changed. "
+                "Use a new label."
+            )
+
+
+def write_prepared(config: dict[str, Any]) -> None:
+    for harness in config["harnesses"]:
+        code = frozen_code(config, harness)
+        stamp = {
+            "config_hash": config_hash(config, harness),
+            "code_sha256": code["code_sha256"],
+            "image_id": code["image_id"],
+            "prepared_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        prepared_stamp(config, harness).write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+
+
 def prepare(config: dict[str, Any], skip_firewall: bool = False, skip_binaries: bool = False, keep_archive: bool = False) -> int:
     data_dir = Path(config["data_dir"])
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -260,6 +320,7 @@ def prepare(config: dict[str, Any], skip_firewall: bool = False, skip_binaries: 
         config = load_config(config["config_path"])
     items = config["tasks"]
     check_in_pool(items, pool)
+    check_frozen(config)
     receipts = freeze_config(config)
     print(f"Split {config['split']}: {len(items)} task(s) x {len(config['harnesses'])} harness(es)")
     for receipt in receipts:
@@ -275,5 +336,6 @@ def prepare(config: dict[str, Any], skip_firewall: bool = False, skip_binaries: 
         start_firewall(config, client)
 
     stage_tasks(config, client, pool, revision, skip_binaries, keep_archive)
+    write_prepared(config)  # last, so run only ever starts on a label whose prepare finished
     print("Subset preparation complete.")
     return 0

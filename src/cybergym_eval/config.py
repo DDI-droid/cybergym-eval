@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 DIFFICULTIES = {"level0", "level1", "level2", "level3"}
 PROVIDERS = {"anthropic", "bedrock", "openai-compatible"}
-SPLITS = {"train", "test", "all"}
 TASK_PREFIXES = ("arvo:", "oss-fuzz:")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RESERVED_LABELS = {"state", "server", "taskset.json"}
@@ -59,19 +60,63 @@ def _check_difficulty(difficulty: Any) -> None:
         raise ValueError(f"Unsupported difficulty: {difficulty!r} (use one of {sorted(DIFFICULTIES)})")
 
 
-def normalize_tasks(tasks: Any, default_difficulty: str) -> list[dict[str, str]] | dict[str, int]:
+def normalize_splits(splits: Any) -> dict[str, float]:
+    """Check a sample's named parts: {"train": 0.75, "test": 0.25}. Fractions above 0 that add up to exactly 1."""
+    if not isinstance(splits, dict) or not splits:
+        raise ValueError('tasks.splits must name at least one part, e.g. {"train": 0.75, "test": 0.25}')
+    total = Fraction(0)
+    for name, share in splits.items():
+        _check_name("a split name", name)
+        if name == "all":
+            raise ValueError('"all" is reserved (split "all" runs every part); give the part another name')
+        if type(share) not in (int, float) or not 0 < share <= 1:
+            raise ValueError(f"tasks.splits[{name!r}] must be a fraction above 0 and at most 1, got {share!r}")
+        total += Fraction(str(share))  # exact decimal arithmetic: 0.7 + 0.1 + 0.2 is exactly 1
+    if total != 1:
+        raise ValueError(f"tasks.splits must add up to 1; {dict(splits)} adds up to {float(total):g}")
+    return dict(splits)
+
+
+def split_counts(total: int, splits: dict[str, float]) -> dict[str, int]:
+    """How many of `total` drawn tasks each part gets, cut in the order the parts are written.
+
+    Each boundary is floor(total x running fraction) and the last part takes the rest, so the counts always add
+    up to total.
+    """
+    counts: dict[str, int] = {}
+    start, running = 0, Fraction(0)
+    for name, share in splits.items():
+        running += Fraction(str(share))
+        end = total if running == 1 else math.floor(total * running)
+        counts[name] = end - start
+        start = end
+    return counts
+
+
+def sample_parts(sample: dict[str, Any]) -> dict[str, float]:
+    """The named parts of a sample; none unless the config gives "splits", so a plain sample is one task set."""
+    return sample.get("splits", {})
+
+
+def normalize_tasks(tasks: Any, default_difficulty: str) -> list[dict[str, str]] | dict[str, Any]:
     if isinstance(tasks, dict):
-        unknown = set(tasks) - {"sample", "seed"}
+        unknown = set(tasks) - {"sample", "seed", "splits"}
         if unknown:
             raise ValueError(f"Unknown keys in the tasks sample: {sorted(unknown)}")
-        if type(tasks.get("sample")) is not int or tasks["sample"] < 2:
-            raise ValueError("tasks.sample must be an integer of at least 2 (it is split into train and test)")
+        if type(tasks.get("sample")) is not int or tasks["sample"] < 1:
+            raise ValueError("tasks.sample must be a whole number of tasks to draw")
         seed = tasks.get("seed", 0)
         if type(seed) is not int:
             raise ValueError("tasks.seed must be an integer")
-        return {"sample": tasks["sample"], "seed": seed}
+        normalized: dict[str, Any] = {"sample": tasks["sample"], "seed": seed}
+        if "splits" in tasks:  # only when given, so existing sampled task sets keep the same identity
+            normalized["splits"] = normalize_splits(tasks["splits"])
+            empty = [name for name, count in split_counts(tasks["sample"], normalized["splits"]).items() if count == 0]
+            if empty:
+                raise ValueError(f"tasks.sample {tasks['sample']} is too small: part(s) {empty} would get no tasks")
+        return normalized
     if not isinstance(tasks, list):
-        raise ValueError('tasks must be a list of task IDs or {"sample": N, "seed": S}')
+        raise ValueError('tasks must be a list of task IDs or {"sample": N, "seed": S, "splits": {...}}')
     if not tasks:
         raise ValueError("tasks must contain at least one CyberGym task")
     items = []
@@ -163,11 +208,30 @@ def _raw_config(config: dict[str, Any]) -> dict[str, Any]:
     return json.loads(Path(config["config_path"]).read_text(encoding="utf-8"))
 
 
+LISTED_HAS_NO_PARTS = (
+    "A listed task set has no parts; use split=all. To divide tasks, give each part its own listed task set, "
+    'or draw a sample with named parts: {"sample": N, "seed": S, "splits": {"train": 0.75, "test": 0.25}}'
+)
+
+
+def _check_split_name(data: dict[str, Any], parts: Any) -> None:
+    if data["split"] == "all" or data["split"] in parts:
+        return
+    if not parts:
+        raise ValueError(
+            f"Task set {data['taskset']!r} is one set with no parts; use split=all, "
+            'or name parts in the sample: "splits": {"train": 0.75, "test": 0.25}'
+        )
+    raise ValueError(f"Task set {data['taskset']!r} has parts {list(parts)}; split must be one of them or 'all', got {data['split']!r}")
+
+
 def _apply_taskset(data: dict[str, Any], raw_tasks: Any) -> None:
     path = taskset_file(data)
     if not path.exists():
         if isinstance(data["tasks"], list) and data["split"] != "all":
-            raise ValueError("A listed task set has no train/test halves; use split=all")
+            raise ValueError(LISTED_HAS_NO_PARTS)
+        if isinstance(data["tasks"], dict):
+            _check_split_name(data, sample_parts(data["tasks"]))
         return
     saved = json.loads(path.read_text(encoding="utf-8"))
     if saved["kind"] == "sample":
@@ -176,13 +240,17 @@ def _apply_taskset(data: dict[str, Any], raw_tasks: Any) -> None:
                 f"Task set {data['taskset']!r} was drawn as {saved['sampled_from']}; "
                 f"this config asks for {raw_tasks!r}. Use a new taskset name."
             )
-        entries = saved["tasks"] if data["split"] == "all" else saved[data["split"]]
+        parts = saved.get("parts", {})
+        if "train" in saved and "test" in saved:  # written by the old code, which always cut a sample in half
+            parts = {"train": saved["train"], "test": saved["test"]}
+        _check_split_name(data, parts)
+        entries = saved["tasks"] if data["split"] == "all" else parts[data["split"]]
         data["sampled_from"] = saved["sampled_from"]
     else:
         if raw_tasks != saved["tasks"]:
             raise ValueError(f"Task set {data['taskset']!r} already lists other tasks ({path}). Use a new taskset name.")
         if data["split"] != "all":
-            raise ValueError("A listed task set has no train/test halves; use split=all")
+            raise ValueError(LISTED_HAS_NO_PARTS)
         entries = saved["tasks"]
     if data.get("dataset_revision") and data["dataset_revision"] != saved["dataset_revision"]:
         raise ValueError(
@@ -197,20 +265,32 @@ def harness_receipt(config: dict[str, Any], harness: dict[str, Any]) -> dict[str
     return {**_raw_config(config), "harnesses": [harness]}
 
 
-def freeze_config(config: dict[str, Any]) -> list[Path]:
+def prepared_stamp(config: dict[str, Any], harness: dict[str, Any]) -> Path:
+    """Written by prepare as its last step; run starts only if it matches the config it is about to run."""
+    return harness_dir(config, harness) / f"prepared.{config['split']}.json"
+
+
+def check_receipts(config: dict[str, Any]) -> list[tuple[Path, dict[str, Any]]]:
+    """Refuse if a label was frozen with a different config file, or holds a split whose tasks overlap. Writes nothing."""
     split = config["split"]
-    overlapping = ["train", "test"] if split == "all" else ["all"]
     plan = []
     for harness in config["harnesses"]:
         folder = harness_dir(config, harness)
         target = folder / f"config.{split}.json"
         receipt = harness_receipt(config, harness)
-        clash = [name for name in overlapping if (folder / f"config.{name}.json").exists()]
+        # Parts of one sample are disjoint, so a label may hold several; "all" overlaps every part.
+        frozen = {path.name[len("config."):-len(".json")] for path in folder.glob("config.*.json")}
+        clash = sorted(frozen - {"all"}) if split == "all" else sorted(frozen & {"all"})
         if clash:
-            raise ValueError(f"{folder} already holds a {clash[0]} run whose tasks overlap split {split!r}. Use a new label.")
+            raise ValueError(f"{folder} already holds a run of split {clash[0]!r}, whose tasks overlap split {split!r}. Use a new label.")
         if target.exists() and json.loads(target.read_text(encoding="utf-8")) != receipt:
             raise ValueError(f"{target} was frozen with different settings. Use a new label for harness {harness['name']!r}.")
         plan.append((target, receipt))
+    return plan
+
+
+def freeze_config(config: dict[str, Any]) -> list[Path]:
+    plan = check_receipts(config)
     for target, receipt in plan:
         if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -233,8 +313,7 @@ def finish_config(data: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     _check_name("taskset", data["taskset"])
     _check_difficulty(data["difficulty"])
     data.setdefault("split", "all")
-    if data["split"] not in SPLITS:
-        raise ValueError(f"Unsupported split: {data['split']!r} (use one of {sorted(SPLITS)})")
+    _check_name("split", data["split"])  # "all", or the name of one part of a sampled task set
     raw_tasks = data["tasks"]
     data["tasks"] = normalize_tasks(raw_tasks, data["difficulty"])
     if data["model_provider"] not in PROVIDERS:
