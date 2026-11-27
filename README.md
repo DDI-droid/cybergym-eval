@@ -37,6 +37,22 @@ Tasks are a list of ids, or a seeded sample. A sample is one task set unless it 
 "split": "train"
 ```
 
+## Models
+
+Each harness names the models it uses in its own `harness.toml` (`models = ["deepseek.v3.2"]`), so changing a harness's model changes its code hash and needs a new label, like any other harness change. The container gets the names as `CYBERGYM_MODELS` (a JSON list); it never sees a URL or a credential. Where each model is served, and what it costs, is a resource of the machine and lives in the run config:
+
+```json
+"models": {
+  "deepseek.v3.2": {"base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+                    "api_key_env": ["OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"],
+                    "price_in_per_m": 0.62, "price_out_per_m": 1.85}
+}
+```
+
+`prepare` refuses a harness whose models are not all in this table. The table is not frozen into labels: editing an entry or adding a model needs no new label. The shim serves the whole table, issues each execution a key for its harness's models only, refuses a request for any other model, and routes each request to its model's endpoint. Preflight fails if the running shim serves a different table (`shim stop`, then `shim start`).
+
+`benchmark_slots`, `start_stagger_seconds`, ports, `env_file` and `experiment_note` can also change between runs of a label; everything else in the config is frozen with it.
+
 ## Or drive it from Python: the Gym
 
 The CLI drives a `harnesses/` directory of Docker images through JSON configs. `cybergym_eval.gym.Gym` is the same machinery as a library, for when you want to try an agent interactively instead of writing a config file:

@@ -33,7 +33,7 @@ from .prepare import MIN_FREE_GB, PROXY_CONTAINER, free_disk_gb, prepare, runner
 from .scheduler import WorkFolderBusy, clean_leftovers, run_specs, work_lock
 from .scheduler import parse_time as _parse_time
 from .server import server_status, start_server, stop_server
-from .shim import shim_status, start_shim, stop_shim
+from .shim import model_credential, shim_status, start_shim, stop_shim
 
 Check = tuple[str, bool, str]
 COMPLETED_STATUSES = {"passed", "benchmark_failed"}
@@ -102,7 +102,23 @@ def _harness_checks(config: dict[str, Any], client: docker.DockerClient | None) 
             present = _has_image(client, image)
             detail = image[:19] if present else f"{image[:19]} is no longer on this machine (removed since prepare?)"
             checks.append((f"harness {harness['label']} frozen image", present, detail))
+        models = code["manifest"].get("models") or []
+        missing = [model for model in models if model not in config["models"]]
+        checks.append((f"harness {harness['label']} models in the models table", bool(models) and not missing,
+                       ", ".join(models) if models and not missing else f"missing {missing or 'a models list'}"))
     return checks
+
+
+def _run_models(config: dict[str, Any]) -> list[str]:
+    """Every model the run's prepared harnesses list."""
+    models: list[str] = []
+    for harness in config["harnesses"]:
+        try:
+            listed = frozen_code(config, harness)["manifest"].get("models") or []
+        except ValueError:
+            continue
+        models.extend(model for model in listed if model not in models)
+    return models
 
 
 def _firewall_checks(config: dict[str, Any], client: docker.DockerClient) -> list[Check]:
@@ -130,19 +146,16 @@ def _service_checks(config: dict[str, Any]) -> list[Check]:
         checks.append((name, ours, detail))
     if checks[0][1] and server["binary_dir"] != config["binary_dir"]:
         checks[0] = (checks[0][0], False, f"running with --binary_dir {server['binary_dir']}, expected {config['binary_dir']}; restart it")
+    if checks[1][1] and shim["table_sha256"] != shim["expected_table_sha256"]:
+        checks[1] = (checks[1][0], False, f"serves models {shim['models']} from a different models table than this config; "
+                     "run: cybergym-eval shim stop, then shim start")
     return checks
 
 
 def _credential_check(config: dict[str, Any]) -> Check:
-    provider = config["model_provider"]
-    found = {
-        "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "openai-compatible": bool(
-            os.getenv("OPENAI_BASE_URL") and (os.getenv("OPENAI_API_KEY") or os.getenv("AWS_BEARER_TOKEN_BEDROCK"))
-        ),
-        "bedrock": bool(os.getenv("AWS_BEARER_TOKEN_BEDROCK") or os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_PROFILE")),
-    }[provider]
-    return (f"{provider} credentials", found, "found" if found else "not found")
+    missing = [name for name, entry in config["models"].items() if not model_credential(entry)]
+    detail = "found for every model in the table" if not missing else f"none for {missing}; set their api_key_env (env_file)"
+    return ("model credentials", not missing, detail)
 
 
 def preflight(config: dict[str, Any], quiet: bool = False) -> int:
@@ -169,10 +182,11 @@ def preflight(config: dict[str, Any], quiet: bool = False) -> int:
         checks.extend(_firewall_checks(config, client))
         checks.extend(_service_checks(config))
     checks.append(_credential_check(config))
-    priced = config.get("price_in_per_m") is not None and config.get("price_out_per_m") is not None
-    detail = (f"${config.get('price_in_per_m')} / ${config.get('price_out_per_m')} per 1M tokens in / out"
-              if priced else "set price_in_per_m and price_out_per_m, or the report cannot show cost")
-    checks.append(("model prices (cost report)", priced, detail))
+    unpriced = [name for name in _run_models(config) if name in config["models"] and (
+        config["models"][name]["price_in_per_m"] is None or config["models"][name]["price_out_per_m"] is None)]
+    detail = ("set for every model the harnesses use" if not unpriced
+              else f"set price_in_per_m and price_out_per_m for {unpriced}, or the report cannot show cost")
+    checks.append(("model prices (cost report)", not unpriced, detail))
     width = max(len(name) for name, _, _ in checks)
     for name, ok, detail in checks:
         if not (quiet and ok):
@@ -185,26 +199,27 @@ def preflight(config: dict[str, Any], quiet: bool = False) -> int:
 
 
 def check_model(config: dict[str, Any]) -> int:
-    if config["model_provider"] != "openai-compatible":
-        print("check-model supports the openai-compatible provider only.", file=sys.stderr)
-        return 1
-    key = os.getenv("OPENAI_API_KEY") or os.getenv("AWS_BEARER_TOKEN_BEDROCK") or ""
-    body = {"model": config["model"], "max_tokens": 16, "messages": [{"role": "user", "content": "Reply with exactly: ok"}]}
-    request = urllib.request.Request(
-        f"{config['openai_base_url'].rstrip('/')}/chat/completions",
-        data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    started = time.monotonic()
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            reply = json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        print(f"Model check failed: HTTP {error.code} {error.read().decode(errors='replace')[:300]}", file=sys.stderr)
-        return 1
-    answer = reply["choices"][0]["message"]["content"]
-    print(f"Model {config['model']} answered {answer!r} in {time.monotonic() - started:.2f}s via {config['openai_base_url']}")
-    return 0
+    """Ask every model in the models table for one short reply, straight at its endpoint (not through the shim)."""
+    failed = 0
+    for name, entry in config["models"].items():
+        body = {"model": name, "max_tokens": 16, "messages": [{"role": "user", "content": "Reply with exactly: ok"}]}
+        request = urllib.request.Request(
+            f"{entry['base_url'].rstrip('/')}/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {model_credential(entry) or ''}", "Content-Type": "application/json"},
+        )
+        started = time.monotonic()
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                reply = json.loads(response.read())
+        except (urllib.error.HTTPError, urllib.error.URLError) as error:
+            detail = f"HTTP {error.code} {error.read().decode(errors='replace')[:300]}" if isinstance(error, urllib.error.HTTPError) else str(error)
+            print(f"Model {name} failed via {entry['base_url']}: {detail}", file=sys.stderr)
+            failed += 1
+            continue
+        answer = reply["choices"][0]["message"]["content"]
+        print(f"Model {name} answered {answer!r} in {time.monotonic() - started:.2f}s via {entry['base_url']}")
+    return 1 if failed else 0
 
 
 def _rows(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -326,7 +341,7 @@ def summarize(config: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, A
     return {
         "taskset": config["taskset"],
         "split": config["split"],
-        "model": config["model"],
+        "models": _run_models(config),
         "benchmark_slots": config["benchmark_slots"],
         "harnesses": [
             summarize_harness(harness, [row for row in rows if row["label"] == harness["label"]])
@@ -457,8 +472,9 @@ def run(config: dict[str, Any]) -> int:
 def check_prepared(config: dict[str, Any]) -> None:
     """run trusts prepare's checks and verifies one thing: that this exact config is the one prepare finished.
 
-    The stamp holds the hash of the resolved config (the file plus env_file values and environment variables
-    such as OPENAI_BASE_URL), so an edit made after prepare, or a prepare that never finished, stops the run here.
+    The stamp holds the hash of the label's frozen settings (every config setting except the unfrozen ones: the
+    models table, slots, stagger, ports, env_file and the note), so a frozen setting edited after prepare, or a
+    prepare that never finished, stops the run here.
     """
     for harness in config["harnesses"]:
         stamp = prepared_stamp(config, harness)
@@ -466,9 +482,8 @@ def check_prepared(config: dict[str, Any]) -> None:
             raise ValueError(f"Label {harness['label']!r} has not been prepared for split {config['split']!r}; run prepare first.")
         if json.loads(stamp.read_text(encoding="utf-8"))["config_hash"] != config_hash(config, harness):
             raise ValueError(
-                f"This config is not the one label {harness['label']!r} was prepared with (the config file, a value from "
-                "env_file or an environment variable such as OPENAI_BASE_URL changed). Run prepare: it checks the change "
-                "and says whether it needs a new label."
+                f"This config is not the one label {harness['label']!r} was prepared with (a frozen setting changed since). "
+                "Run prepare: it checks the change and says whether it needs a new label."
             )
 
 

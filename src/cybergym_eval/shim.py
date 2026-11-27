@@ -30,24 +30,44 @@ PROCESS_MARKER = "cybergym_eval.shim"
 
 
 class Meter:
-    def __init__(self, price_in: float | None, price_out: float | None, log_path: Path):
-        self.price_in, self.price_out = price_in, price_out
+    def __init__(self, prices: dict[str, tuple[float | None, float | None]], log_path: Path):
+        self.prices = prices  # model name -> (dollars per million input tokens, per million output tokens)
         self.log_path = log_path
         self.keys: dict[str, dict[str, Any]] = {}
         # Counters of revoked keys. A request already in flight when its key is revoked is still attributed to it.
         self.retired: dict[str, dict[str, Any]] = {}
         self.lock = threading.Lock()
 
-    def issue(self, alias: str) -> str:
+    def issue(self, alias: str, models: list[str]) -> str:
         key = "cge-" + secrets.token_hex(16)
         with self.lock:
             self.keys[key] = {
-                "alias": alias, "requests": 0, "input_tokens": 0, "output_tokens": 0,
+                "alias": alias, "models": list(models), "requests": 0, "input_tokens": 0, "output_tokens": 0,
                 "cost_usd": 0.0, "throttled": 0, "retries": 0, "errors": 0, "model_seconds": 0.0,
                 "discarded_attempts": 0, "discarded_input_tokens": 0, "discarded_output_tokens": 0,
-                "unmeasured_attempts": 0, "unmeasured_input_tokens_est": 0, "inflight": 0,
+                "unmeasured_attempts": 0, "unmeasured_input_tokens_est": 0, "inflight": 0, "by_model": {},
             }
         return key
+
+    def allowed(self, key: str) -> list[str]:
+        """The models this key may use: the ones its harness lists in harness.toml."""
+        with self.lock:
+            counters = self.keys.get(key)
+            return list(counters["models"]) if counters else []
+
+    def _cost(self, model: str, inp: int, out: int) -> float:
+        price_in, price_out = self.prices.get(model, (None, None))
+        return ((inp * (price_in or 0)) + (out * (price_out or 0))) / 1e6
+
+    @staticmethod
+    def _add(counters: dict[str, Any], model: str, inp: int, out: int, cost: float) -> None:
+        counters["input_tokens"] += inp
+        counters["output_tokens"] += out
+        counters["cost_usd"] = round(counters["cost_usd"] + cost, 6)
+        per_model = counters["by_model"].setdefault(model, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0})
+        per_model["input_tokens"] += inp
+        per_model["output_tokens"] += out
+        per_model["cost_usd"] = round(per_model["cost_usd"] + cost, 6)
 
     def _counters(self, key: str) -> dict[str, Any] | None:
         """Counters of a live key, or of a revoked one (caller holds the lock)."""
@@ -92,11 +112,13 @@ class Meter:
             counters = self._counters(key)
             return dict(counters) if counters is not None else None
 
-    def record_discarded(self, key: str, usage: dict[str, Any] | None, estimated_input: float, seconds: float, reason: str) -> None:
+    def record_discarded(
+        self, key: str, model: str, usage: dict[str, Any] | None, estimated_input: float, seconds: float, reason: str
+    ) -> None:
         inp = int((usage or {}).get("prompt_tokens") or 0)
         out = int((usage or {}).get("completion_tokens") or 0)
         measured = inp > 0 or out > 0
-        cost = ((inp * (self.price_in or 0)) + (out * (self.price_out or 0))) / 1e6
+        cost = self._cost(model, inp, out)
         with self.lock:
             counters = self._counters(key)
             alias = None
@@ -104,33 +126,33 @@ class Meter:
                 alias = counters["alias"]
                 counters["discarded_attempts"] += 1
                 if measured:
-                    counters["input_tokens"] += inp
-                    counters["output_tokens"] += out
-                    counters["cost_usd"] = round(counters["cost_usd"] + cost, 6)
+                    self._add(counters, model, inp, out, cost)
                     counters["discarded_input_tokens"] += inp
                     counters["discarded_output_tokens"] += out
                 else:
                     counters["unmeasured_attempts"] += 1
                     counters["unmeasured_input_tokens_est"] += int(estimated_input)
             line = {
-                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "alias": alias, "status": 502, "discarded": True,
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "alias": alias, "model": model,
+                "status": 502, "discarded": True,
                 "reason": reason, "measured": measured, "seconds": round(seconds, 3), "input_tokens": inp, "output_tokens": out,
                 "est_input_tokens_unmeasured": 0 if measured else int(estimated_input), "throttled": 0, "retries": 0, "stream": True,
             }
             with self.log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(line) + "\n")
 
-    def record(self, key: str, status: int, usage: dict[str, Any] | None, seconds: float, throttled: int, retries: int, stream: bool) -> None:
+    def record(
+        self, key: str, model: str, status: int, usage: dict[str, Any] | None, seconds: float, throttled: int, retries: int, stream: bool
+    ) -> None:
         inp = int((usage or {}).get("prompt_tokens") or 0)
         out = int((usage or {}).get("completion_tokens") or 0)
-        cost = ((inp * (self.price_in or 0)) + (out * (self.price_out or 0))) / 1e6
+        cost = self._cost(model, inp, out)
         with self.lock:
             counters = self._counters(key)
             if counters is not None:
                 counters["requests"] += 1
-                counters["input_tokens"] += inp
-                counters["output_tokens"] += out
-                counters["cost_usd"] = round(counters["cost_usd"] + cost, 6)
+                self._add(counters, model, inp, out, cost)
+                counters["by_model"][model]["requests"] += 1
                 counters["throttled"] += throttled
                 counters["retries"] += retries
                 counters["errors"] += status >= 400
@@ -139,7 +161,7 @@ class Meter:
             else:
                 alias = None
             line = {
-                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "alias": alias, "status": status,
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "alias": alias, "model": model, "status": status,
                 "seconds": round(seconds, 3), "input_tokens": inp, "output_tokens": out, "throttled": throttled,
                 "retries": retries, "stream": stream,
             }
@@ -158,9 +180,13 @@ def usage_of(lines: list[bytes]) -> dict[str, Any] | None:
     return usage
 
 
-def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, master_key: str, max_retries: int):
-    target = urlparse(upstream)
-    chat_path = target.path.rstrip("/") + "/chat/completions"
+def make_handler(meter: Meter, endpoints: dict[str, dict[str, str]], master_key: str, max_retries: int, table_sha256: str):
+    """endpoints: model name -> {"base_url", "api_key"}. Each request goes to the endpoint of the model it names,
+    which must be one of the models its key was issued for."""
+    targets = {}
+    for name, endpoint in endpoints.items():
+        parsed = urlparse(endpoint["base_url"])
+        targets[name] = (parsed, parsed.path.rstrip("/") + "/chat/completions", endpoint["api_key"])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args: Any) -> None:
@@ -184,10 +210,11 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path == "/health":
-                return self._json(200, {"ok": True, "model": model})
+            if parsed.path == "/health":  # names and a hash of the table only: no URLs or credentials
+                return self._json(200, {"ok": True, "models": sorted(targets), "table_sha256": table_sha256})
             if parsed.path.rstrip("/") == "/v1/models":
-                return self._json(200, {"object": "list", "data": [{"id": model, "object": "model"}]})
+                names = meter.allowed(self._bearer()) or sorted(targets)
+                return self._json(200, {"object": "list", "data": [{"id": name, "object": "model"} for name in names]})
             if parsed.path == "/key/info" and self._bearer() == master_key:
                 info = meter.info(parse_qs(parsed.query).get("key", [""])[0])
                 return self._json(200 if info else 404, {"info": info})
@@ -200,7 +227,10 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
                     return self._json(403, {"error": "forbidden"})
                 body = self._body()
                 if path == "/key/generate":
-                    return self._json(200, {"key": meter.issue(str(body.get("alias", "")))})
+                    models = body.get("models")
+                    if not isinstance(models, list) or not models or any(m not in targets for m in models):
+                        return self._json(400, {"error": f"models must be a non-empty list of served models {sorted(targets)}, got {models!r}"})
+                    return self._json(200, {"key": meter.issue(str(body.get("alias", "")), models)})
                 name = str(body.get("key", ""))
                 if path == "/key/block":
                     with meter.lock:
@@ -216,13 +246,22 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
             if denied:
                 return self._json(denied[0], {"error": {"message": denied[2], "type": denied[1]}})
             body = self._body()
+            allowed = meter.allowed(key)
+            model = body.get("model")
+            if model is None and len(allowed) == 1:
+                model = allowed[0]
+            if model not in allowed:
+                return self._json(400, {"error": {
+                    "message": f"model {model!r} is not one this execution may use; its harness lists {allowed}",
+                    "type": "model_not_allowed"}})
             body["model"] = model
             stream = bool(body.get("stream"))
             if stream:
                 body["stream_options"] = {"include_usage": True}
-            self._forward(key, json.dumps(body).encode(), stream)
+            self._forward(key, model, json.dumps(body).encode(), stream)
 
-        def _open(self, payload: bytes, stream: bool) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+        def _open(self, model: str, payload: bytes, stream: bool) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+            target, chat_path, upstream_key = targets[model]
             connection_class = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
             timeout = STREAM_IDLE_TIMEOUT_SECONDS if stream else REQUEST_TIMEOUT_SECONDS
             connection = connection_class(target.hostname, target.port, timeout=timeout)
@@ -232,7 +271,7 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
             )
             return connection, connection.getresponse()
 
-        def _forward(self, key: str, payload: bytes, stream: bool) -> None:
+        def _forward(self, key: str, model: str, payload: bytes, stream: bool) -> None:
             """Relay one request upstream, retrying failures.
 
             Usage is metered as soon as the upstream outcome is known, before anything is written to the client,
@@ -244,24 +283,24 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
             outcome = {"recorded": False}
             started = time.monotonic()
             try:
-                self._relay(key, payload, stream, started, outcome)
+                self._relay(key, model, payload, stream, started, outcome)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the client went away; what the upstream cost was recorded before any write
             finally:
                 if not outcome["recorded"]:
                     meter.record_discarded(
-                        key, None, len(payload) / 3.3, time.monotonic() - started,
+                        key, model, None, len(payload) / 3.3, time.monotonic() - started,
                         "the handler ended before the upstream outcome was recorded",
                     )
                 meter.end(key)
 
-        def _relay(self, key: str, payload: bytes, stream: bool, started: float, outcome: dict[str, bool]) -> None:
+        def _relay(self, key: str, model: str, payload: bytes, stream: bool, started: float, outcome: dict[str, bool]) -> None:
             throttled = retries = 0
             client_gone = threading.Event()
 
             def settle(status: int, usage: dict[str, Any] | None) -> None:
                 outcome["recorded"] = True
-                meter.record(key, status, usage, time.monotonic() - started, throttled, retries, stream)
+                meter.record(key, model, status, usage, time.monotonic() - started, throttled, retries, stream)
 
             def client_closed() -> bool:
                 """True once the client has closed its end (a peek at the socket; no data is consumed)."""
@@ -288,7 +327,7 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
                         return self._json(denied[0], {"error": {
                             "message": f"no further upstream attempt was made: {denied[2]}", "type": denied[1]}})
                 try:
-                    connection, response = self._open(payload, stream)
+                    connection, response = self._open(model, payload, stream)
                 except OSError as error:
                     if attempt < max_retries:
                         retries += 1
@@ -347,7 +386,7 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
                 connection.close()
                 while problem and attempt < max_retries:
                     if streamed:
-                        meter.record_discarded(key, usage_of(lines), len(payload) / 3.3, time.monotonic() - attempt_started, problem)
+                        meter.record_discarded(key, model, usage_of(lines), len(payload) / 3.3, time.monotonic() - attempt_started, problem)
                     attempt += 1
                     retries += 1
                     time.sleep(min(30, 2 ** attempt))
@@ -358,7 +397,7 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
                         break
                     attempt_started = time.monotonic()
                     try:
-                        connection, response = self._open(payload, stream)
+                        connection, response = self._open(model, payload, stream)
                     except OSError:
                         continue
                     if response.status != 200:
@@ -377,7 +416,7 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
                 # complete-looking tool call, and the client must not act on it. Meter first, then answer with an
                 # explicit terminal error event (an SDK client raises on it; there is no [DONE]).
                 if streamed and usage is None:
-                    meter.record_discarded(key, None, len(payload) / 3.3, time.monotonic() - attempt_started, problem)
+                    meter.record_discarded(key, model, None, len(payload) / 3.3, time.monotonic() - attempt_started, problem)
                 settle(502, usage)
                 event = {"error": {
                     "message": f"upstream stream failed after {attempt + 1} attempt(s): {problem}",
@@ -418,16 +457,15 @@ def make_handler(meter: Meter, upstream: str, upstream_key: str, model: str, mas
 
 
 def serve() -> None:
-    price_in = os.environ.get("SHIM_PRICE_IN_PER_M")
-    price_out = os.environ.get("SHIM_PRICE_OUT_PER_M")
-    meter = Meter(float(price_in) if price_in else None, float(price_out) if price_out else None, Path(os.environ["SHIM_LOG"]))
+    table = json.loads(os.environ["SHIM_MODELS"])  # model -> {base_url, api_key, price_in_per_m, price_out_per_m}
+    meter = Meter({name: (entry.get("price_in_per_m"), entry.get("price_out_per_m")) for name, entry in table.items()},
+                  Path(os.environ["SHIM_LOG"]))
     handler = make_handler(
         meter,
-        os.environ["SHIM_UPSTREAM"],
-        os.environ["SHIM_UPSTREAM_KEY"],
-        os.environ["SHIM_MODEL"],
+        {name: {"base_url": entry["base_url"], "api_key": entry["api_key"]} for name, entry in table.items()},
         os.environ["SHIM_MASTER_KEY"],
         int(os.environ.get("SHIM_MAX_RETRIES", "6")),
+        os.environ["SHIM_MODELS_SHA256"],
     )
     server = ThreadingHTTPServer((os.environ["SHIM_BIND"], int(os.environ["SHIM_PORT"])), handler)
     server.daemon_threads = True
@@ -482,33 +520,54 @@ def shim_url(config: dict[str, Any]) -> str:
     return f"http://{server_host(config)}:{config['shim_port']}/v1"
 
 
+def model_credential(entry: dict[str, Any]) -> str | None:
+    """The credential for one models-table entry: the first of its api_key_env variables that is set."""
+    return next((os.environ[name] for name in entry["api_key_env"] if os.environ.get(name)), None)
+
+
+def _health(config: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        with urllib.request.urlopen(shim_url(config).removesuffix("/v1") + "/health", timeout=5) as response:
+            return json.loads(response.read())
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def start_shim(config: dict[str, Any]) -> str:
+    from .config import models_table_sha256
     from .server import server_host
 
     host, port = server_host(config), config["shim_port"]
     url = f"http://{host}:{port}/v1"
+    expected = models_table_sha256(config["models"])
     if _running_pid(config):
+        running = (_health(config) or {}).get("table_sha256")
+        if running != expected:
+            raise RuntimeError(
+                "The shim already running for this work root serves a different models table than this config. "
+                "Stop it with `cybergym-eval shim stop` (no run may be using it) and start it again."
+            )
         return url
     if _listening(host, port):
         raise RuntimeError(f"Something else is already listening on {host}:{port}")
-    upstream_key = os.getenv("OPENAI_API_KEY") or os.getenv("AWS_BEARER_TOKEN_BEDROCK")
-    if not upstream_key:
-        raise RuntimeError("No model credential in the environment; set env_file in the config")
+    table = {}
+    for name, entry in config["models"].items():
+        credential = model_credential(entry)
+        if not credential:
+            raise RuntimeError(f"No credential for model {name!r}: set one of {entry['api_key_env']} (for example in env_file)")
+        table[name] = {"base_url": entry["base_url"], "api_key": credential,
+                       "price_in_per_m": entry["price_in_per_m"], "price_out_per_m": entry["price_out_per_m"]}
     directory = shim_dir(config)
     directory.mkdir(parents=True, exist_ok=True)
     env = {
         **os.environ,
-        "SHIM_UPSTREAM": config["openai_base_url"],
-        "SHIM_UPSTREAM_KEY": upstream_key,
-        "SHIM_MODEL": config["model"],
+        "SHIM_MODELS": json.dumps(table),  # the credentials live only in the shim's environment, never in a container
+        "SHIM_MODELS_SHA256": expected,
         "SHIM_MASTER_KEY": master_key(),
         "SHIM_BIND": host,
         "SHIM_PORT": str(port),
         "SHIM_LOG": str(directory / "requests.jsonl"),
     }
-    for key in ("price_in_per_m", "price_out_per_m"):
-        if config.get(key) is not None:
-            env[f"SHIM_{key.upper()}"] = str(config[key])
     with (directory / "shim.out").open("ab") as out:
         process = subprocess.Popen(
             [sys.executable, "-m", PROCESS_MARKER], env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
@@ -541,16 +600,22 @@ def stop_shim(config: dict[str, Any]) -> bool:
 
 
 def shim_status(config: dict[str, Any]) -> dict[str, Any]:
+    from .config import models_table_sha256
     from .server import server_host
 
     try:
         host = server_host(config)
     except RuntimeError as error:
         return {"url": None, "pid": None, "listening": False, "detail": str(error)}
+    listening = _listening(host, config["shim_port"])
+    health = _health(config) if listening else None
     return {
         "url": f"http://{host}:{config['shim_port']}/v1",
         "pid": _running_pid(config),
-        "listening": _listening(host, config["shim_port"]),
+        "listening": listening,
+        "models": (health or {}).get("models"),
+        "table_sha256": (health or {}).get("table_sha256"),
+        "expected_table_sha256": models_table_sha256(config["models"]),
         "detail": str(shim_dir(config)),
     }
 
@@ -567,8 +632,9 @@ def _manage(config: dict[str, Any], method: str, path: str, body: dict[str, Any]
         return json.loads(response.read())
 
 
-def issue_key(config: dict[str, Any], alias: str) -> str:
-    return _manage(config, "POST", "/key/generate", {"alias": alias})["key"]
+def issue_key(config: dict[str, Any], alias: str, models: list[str]) -> str:
+    """A key for one execution, valid only for the models its harness lists."""
+    return _manage(config, "POST", "/key/generate", {"alias": alias, "models": models})["key"]
 
 
 def key_usage(config: dict[str, Any], key: str) -> dict[str, Any] | None:

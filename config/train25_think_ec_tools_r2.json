@@ -50,11 +50,17 @@
   "task_cpus": 1,
   "task_memory_gb": 2,
   "use_firewall": true,
-  "model_provider": "openai-compatible",
-  "model": "deepseek.v3.2",
-  "aws_region": "us-east-1",
-  "price_in_per_m": 0.62,
-  "price_out_per_m": 1.85,
+  "models": {
+    "deepseek.v3.2": {
+      "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+      "api_key_env": [
+        "OPENAI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK"
+      ],
+      "price_in_per_m": 0.62,
+      "price_out_per_m": 1.85
+    }
+  },
   "agent_timeout_seconds": 7200,
   "task_deadline_seconds": 8100,
   "experiment_note": "Run 4 of codex_think_ec (label codex_think_ec_tools_r2): the tools harness, 15 agents at once. Differences from the v5 label: every tool call runs under a supervisor with a wall-clock deadline that kills the whole process tree including detached children (60 s default, 300 s max, an invalid timeout is rejected); unconfirmed cleanup is an infrastructure error; DeepSeek's native tool-call syntax is recovered into a real call when it leaks as text; the submit client has a bounded 200 s budget inside a 240 s tool deadline, a real exponential backoff, at most 8 HTTP attempts per call and a quiet curl, and labels a rate-limited reply as such. Earlier attempts of this experiment were stopped by the operator and are kept as evidence: codex_think_ec (v4), codex_think_ec_v5 (D39), and codex_think_ec_tools (stopped after 12 minutes: the submit client retried every 2-6 s and made ~1,000 requests the server rejected as rate limited; the server itself had no errors)."

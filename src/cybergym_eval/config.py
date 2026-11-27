@@ -12,11 +12,16 @@ from typing import Any
 from urllib.parse import urlparse
 
 DIFFICULTIES = {"level0", "level1", "level2", "level3"}
-PROVIDERS = {"anthropic", "bedrock", "openai-compatible"}
 TASK_PREFIXES = ("arvo:", "oss-fuzz:")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RESERVED_LABELS = {"state", "server", "taskset.json"}
-REQUIRED = {"benchmark_root", "work_root", "taskset", "tasks", "difficulty", "harnesses", "model_provider"}
+REQUIRED = {"benchmark_root", "work_root", "taskset", "tasks", "difficulty", "harnesses", "models"}
+MODEL_FIELDS = {"base_url", "api_key_env", "price_in_per_m", "price_out_per_m"}
+# Settings that can change between runs of a label without making it a different experiment: where each model is
+# served and what it costs (the harness's harness.toml names its models, and that is frozen in its code hash),
+# concurrency, start spacing, ports, the credentials file and the note. They are left out of the frozen receipt
+# and of the config hash, so changing them needs no new label and keeps the execution ids.
+UNFROZEN_KEYS = {"models", "benchmark_slots", "start_stagger_seconds", "shim_port", "server_port", "env_file", "experiment_note"}
 DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
 DEADLINE_MARGIN_SECONDS = 900
 
@@ -135,6 +140,45 @@ def normalize_tasks(tasks: Any, default_difficulty: str) -> list[dict[str, str]]
     if len(set(names)) != len(names):
         raise ValueError("A task may appear only once in a config; run another level under a new label")
     return items
+
+
+def normalize_models(raw: Any) -> dict[str, dict[str, Any]]:
+    """The run config's models table: model name -> where it is served, which credential, and its prices.
+
+    The names are what harnesses list in their harness.toml; the rest stays on the host, with the shim.
+    """
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError('models must name at least one model, e.g. {"deepseek.v3.2": {"base_url": "https://…/v1", '
+                         '"api_key_env": "OPENAI_API_KEY", "price_in_per_m": 0.62, "price_out_per_m": 1.85}}')
+    table = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not name or any(c.isspace() for c in name):
+            raise ValueError(f"A model name must be a non-empty string without spaces, got {name!r}")
+        if not isinstance(entry, dict):
+            raise ValueError(f"models[{name!r}] must be an object")
+        unknown = set(entry) - MODEL_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown keys in models[{name!r}]: {sorted(unknown)} (use {sorted(MODEL_FIELDS)})")
+        url = entry.get("base_url")
+        if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https") or not urlparse(url).hostname:
+            raise ValueError(f"models[{name!r}].base_url must be an http(s) URL, got {url!r}")
+        key_env = entry.get("api_key_env")
+        names = [key_env] if isinstance(key_env, str) else key_env
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) and n for n in names):
+            raise ValueError(f"models[{name!r}].api_key_env must name the environment variable holding its credential "
+                             "(or a list of names, the first one set is used)")
+        for price in ("price_in_per_m", "price_out_per_m"):
+            value = entry.get(price)
+            if value is not None and (type(value) not in (int, float) or value < 0):
+                raise ValueError(f"models[{name!r}].{price} must be a number of dollars per million tokens")
+        table[name] = {"base_url": url, "api_key_env": names, "price_in_per_m": entry.get("price_in_per_m"),
+                       "price_out_per_m": entry.get("price_out_per_m")}
+    return table
+
+
+def models_table_sha256(models: dict[str, dict[str, Any]]) -> str:
+    """Identifies a models table without its secrets: names, URLs, credential variable names and prices."""
+    return hashlib.sha256(json.dumps(models, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def normalize_harnesses(raw: Any) -> list[dict[str, Any]]:
@@ -262,7 +306,8 @@ def _apply_taskset(data: dict[str, Any], raw_tasks: Any) -> None:
 
 
 def harness_receipt(config: dict[str, Any], harness: dict[str, Any]) -> dict[str, Any]:
-    return {**_raw_config(config), "harnesses": [harness]}
+    raw = {key: value for key, value in _raw_config(config).items() if key not in UNFROZEN_KEYS}
+    return {**raw, "harnesses": [harness]}
 
 
 def prepared_stamp(config: dict[str, Any], harness: dict[str, Any]) -> Path:
@@ -316,8 +361,7 @@ def finish_config(data: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     _check_name("split", data["split"])  # "all", or the name of one part of a sampled task set
     raw_tasks = data["tasks"]
     data["tasks"] = normalize_tasks(raw_tasks, data["difficulty"])
-    if data["model_provider"] not in PROVIDERS:
-        raise ValueError(f"Unsupported model_provider: {data['model_provider']}")
+    data["models"] = normalize_models(data["models"])
     data["benchmark_root"] = str(Path(data["benchmark_root"]).expanduser().resolve())
     data["work_root"] = str(Path(data["work_root"]).expanduser().resolve())
     data["data_dir"] = str(Path(data.get("data_dir", "~/cybergym_data")).expanduser().resolve())
@@ -334,9 +378,6 @@ def finish_config(data: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     data.setdefault("task_memory_gb", 6)
     data.setdefault("benchmark_slots", 1)
     data.setdefault("use_firewall", True)
-    data.setdefault("model", "")
-    data.setdefault("aws_region", "us-east-1")
-    data.setdefault("openai_base_url", "")
     data.setdefault("start_stagger_seconds", 0)
     data.setdefault("scheduling_strategy", "")
     data.setdefault("shim_port", 4100)
@@ -348,27 +389,15 @@ def finish_config(data: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             env_path = base_dir / env_path
         data["env_file"] = str(env_path.resolve())
         _load_env_file(Path(data["env_file"]))
-    if data["model_provider"] == "openai-compatible":
-        data["openai_base_url"] = (
-            data["openai_base_url"]
-            or os.environ.get("OPENAI_BASE_URL")
-            or f"https://bedrock-runtime.{data['aws_region']}.amazonaws.com/openai/v1"
-        )
-        os.environ.setdefault("OPENAI_BASE_URL", data["openai_base_url"])
-    if "firewall_domains" not in data:
-        default_domains = []
-        if data["model_provider"] == "bedrock":
-            default_domains.append(f"bedrock-runtime.{data['aws_region']}.amazonaws.com")
-        elif data["model_provider"] == "openai-compatible" and data["openai_base_url"]:
-            host = urlparse(data["openai_base_url"]).hostname
-            if host:
-                default_domains.append(host)
-        data["firewall_domains"] = default_domains
+    # Domains the firewall proxy lets agents reach. None by default: agents reach models only through the shim, which
+    # runs on the host and talks to the model endpoints itself, so no container needs a model host. An explicit list
+    # is frozen with the label, since it decides what an agent can reach.
+    data.setdefault("firewall_domains", [])
     return data
 
 
 def config_hash(config: dict[str, Any], harness: dict[str, Any] | None = None) -> str:
-    material = {k: v for k, v in config.items() if k not in ("config_path", "harnesses")}
+    material = {k: v for k, v in config.items() if k not in ("config_path", "harnesses", *UNFROZEN_KEYS)}
     material["harness"] = harness
     payload = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()

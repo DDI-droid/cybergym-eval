@@ -25,7 +25,7 @@ from .config import (
     split_counts,
     taskset_file,
 )
-from .harnesses import check_code, frozen_code, snapshot_code
+from .harnesses import check_code, frozen_code, harness_models, snapshot_code
 
 DATASET = "sunblaze-ucb/cybergym"
 BINARY_DATASET = "sunblaze-ucb/cybergym-server-binary"
@@ -281,20 +281,27 @@ def _recorded_hashes(config: dict[str, Any]) -> dict[str, set[str]]:
 def check_frozen(config: dict[str, Any]) -> None:
     """Every freeze check, before anything is written, so a refusal leaves nothing half frozen.
 
-    The config file as written (receipt), the resolved settings (stamp and earlier rows), the harness code (hash)
-    and the harness image (id). run trusts these and only checks that its config is the one prepared.
+    The config file as written (receipt), the resolved settings (stamp and earlier rows), the harness code (hash),
+    the harness image (id), and that every model a harness names is in the run config's models table.
+    run trusts these and only checks that its config is the one prepared.
     """
     check_receipts(config)
     recorded = _recorded_hashes(config)
     for harness in config["harnesses"]:
         check_code(config, harness)
+        missing = [model for model in harness_models(config, harness) if model not in config["models"]]
+        if missing:
+            raise ValueError(
+                f"Harness {harness['name']!r} uses model(s) {missing}, which this run config's models table does not "
+                f"define (it has {sorted(config['models'])}). Add them to models, with their base_url and api_key_env."
+            )
         current = config_hash(config, harness)
         stamp = prepared_stamp(config, harness)
         before = {json.loads(stamp.read_text(encoding="utf-8"))["config_hash"]} if stamp.exists() else set()
         if (before | recorded.get(harness["label"], set())) - {current}:
             raise ValueError(
                 f"Label {harness['label']!r} was prepared or run with different settings for split {config['split']!r}: "
-                "the config file, a value from env_file or an environment variable such as OPENAI_BASE_URL changed. "
+                "a frozen setting in the config changed. "
                 "Use a new label."
             )
 
